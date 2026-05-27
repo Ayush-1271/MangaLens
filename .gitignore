@@ -1,0 +1,13 @@
+# don't commit the zip
+*.zip
+
+# OS stuff
+.DS_Store
+Thumbs.db
+
+# editor files
+.vscode/
+.idea/
+
+# if anyone clones and adds node stuff for testing
+node_modules/

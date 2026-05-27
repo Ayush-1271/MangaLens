@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>MangaLens</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 300px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #111118;
+      color: #ddd;
+      font-size: 13px;
+    }
+
+    .top {
+      background: linear-gradient(135deg, #6d28d9, #4338ca);
+      padding: 14px 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .top span { font-size: 20px; }
+    .top h1 { font-size: 14px; font-weight: 600; color: #fff; }
+    .top p  { font-size: 11px; color: rgba(255,255,255,0.65); margin-top: 1px; }
+
+    .row-toggle {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 16px;
+      border-bottom: 1px solid #1f1f2e;
+    }
+    .row-toggle .label { font-weight: 500; }
+    .row-toggle .sub   { font-size: 11px; color: #777; margin-top: 1px; }
+
+    /* toggle switch */
+    .switch { position: relative; width: 38px; height: 20px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .track {
+      position: absolute; inset: 0;
+      background: #333; border-radius: 20px; cursor: pointer; transition: .2s;
+    }
+    .track::before {
+      content: ""; position: absolute;
+      width: 14px; height: 14px; border-radius: 50%;
+      background: #fff; left: 3px; top: 3px; transition: .2s;
+    }
+    input:checked + .track { background: #6d28d9; }
+    input:checked + .track::before { transform: translateX(18px); }
+
+    .body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+
+    .status {
+      display: flex; align-items: center; gap: 7px;
+      background: #1a1a28; border: 1px solid #262636;
+      border-radius: 6px; padding: 7px 10px; font-size: 12px; color: #888;
+    }
+    .dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: #444; flex-shrink: 0; transition: background .2s;
+    }
+    .dot.ok   { background: #22c55e; }
+    .dot.err  { background: #ef4444; }
+    .dot.busy { background: #f59e0b; animation: blink 0.9s infinite; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+    .field label {
+      display: block; font-size: 11px; font-weight: 500;
+      color: #888; margin-bottom: 5px;
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .field input, .field select {
+      width: 100%;
+      background: #1a1a28; border: 1px solid #262636; border-radius: 6px;
+      padding: 7px 9px; font-size: 13px; color: #ddd;
+      outline: none; font-family: inherit; transition: border-color .15s;
+    }
+    .field input:focus, .field select:focus { border-color: #6d28d9; }
+    .field input::placeholder { color: #444; }
+    .hint { font-size: 10px; color: #555; margin-top: 4px; }
+    .hint a { color: #7c6fcd; text-decoration: none; }
+    .hint a:hover { text-decoration: underline; }
+
+    .btn-save {
+      width: 100%; padding: 9px;
+      background: linear-gradient(135deg, #6d28d9, #4338ca);
+      border: none; border-radius: 7px;
+      color: #fff; font-size: 13px; font-weight: 600;
+      cursor: pointer; font-family: inherit; transition: opacity .15s;
+    }
+    .btn-save:hover { opacity: 0.85; }
+
+    .glossary {
+      border-top: 1px solid #1f1f2e;
+      padding: 12px 16px;
+    }
+    .glossary-head {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 8px;
+    }
+    .glossary-head span { font-size: 11px; font-weight: 600; color: #777; text-transform: uppercase; letter-spacing: 0.04em; }
+    .btn-clear {
+      font-size: 10px; color: #ef4444; background: none;
+      border: none; cursor: pointer; font-family: inherit;
+      padding: 2px 5px; border-radius: 3px;
+    }
+    .btn-clear:hover { background: rgba(239,68,68,0.1); }
+
+    .glist { max-height: 90px; overflow-y: auto; font-size: 11px; }
+    .gitem {
+      display: flex; justify-content: space-between; gap: 4px;
+      padding: 3px 0; border-bottom: 1px solid #1a1a28;
+    }
+    .gitem:last-child { border: none; }
+    .go { color: #888; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .arr { color: #444; }
+    .gt { color: #93c5fd; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
+    .gempty { color: #444; font-style: italic; font-size: 11px; }
+
+    .foot {
+      text-align: center; padding: 8px 16px 12px;
+      font-size: 10px; color: #333;
+    }
+  </style>
+</head>
+<body>
+
+<div class="top">
+  <span>🔍</span>
+  <div>
+    <h1>MangaLens</h1>
+    <p>Translates text inside manga images</p>
+  </div>
+</div>
+
+<div class="row-toggle">
+  <div>
+    <div class="label">Enable on this page</div>
+    <div class="sub">Auto-translates manga images</div>
+  </div>
+  <label class="switch">
+    <input type="checkbox" id="chkEnabled">
+    <span class="track"></span>
+  </label>
+</div>
+
+<div class="body">
+  <div class="status">
+    <div class="dot" id="dot"></div>
+    <span id="statusMsg">Enter your API key to start</span>
+  </div>
+
+  <div class="field">
+    <label>Gemini API Key</label>
+    <input type="password" id="apiKey" placeholder="AIza...">
+    <div class="hint">
+      Free key at <a href="https://aistudio.google.com/app/apikey" target="_blank">aistudio.google.com</a> — 15 req/min free
+    </div>
+  </div>
+
+  <div class="field">
+    <label>Translate to</label>
+    <select id="lang">
+      <option value="English">English</option>
+      <option value="Hindi">Hindi</option>
+      <option value="Spanish">Spanish</option>
+      <option value="French">French</option>
+      <option value="Portuguese">Portuguese</option>
+      <option value="German">German</option>
+      <option value="Indonesian">Indonesian</option>
+      <option value="Arabic">Arabic</option>
+      <option value="Russian">Russian</option>
+      <option value="Turkish">Turkish</option>
+      <option value="Thai">Thai</option>
+      <option value="Vietnamese">Vietnamese</option>
+      <option value="Italian">Italian</option>
+      <option value="Polish">Polish</option>
+      <option value="Dutch">Dutch</option>
+      <option value="Korean">Korean</option>
+      <option value="Chinese (Simplified)">Chinese (Simplified)</option>
+      <option value="Japanese">Japanese</option>
+    </select>
+  </div>
+
+  <button class="btn-save" id="btnSave">Save</button>
+</div>
+
+<div class="glossary">
+  <div class="glossary-head">
+    <span>Translation memory</span>
+    <button class="btn-clear" id="btnClear">clear</button>
+  </div>
+  <div class="glist" id="glist">
+    <span class="gempty">Builds as you read — keeps names consistent</span>
+  </div>
+</div>
+
+<div class="foot">Powered by Gemini 1.5 Flash Vision</div>
+
+<script src="popup.js"></script>
+</body>
+</html>

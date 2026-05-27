@@ -1,0 +1,51 @@
+name: Package Extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version from manifest
+        id: version
+        run: |
+          VERSION=$(cat manifest.json | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Package extension zip
+        run: |
+          zip -r MangaLens-v${{ steps.version.outputs.version }}.zip \
+            manifest.json \
+            background.js \
+            content.js \
+            popup.html \
+            popup.js \
+            icons/ \
+            README.md \
+            --exclude "*.DS_Store"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: MangaLens v${{ steps.version.outputs.version }}
+          body: |
+            ## Install
+            1. Download `MangaLens-v${{ steps.version.outputs.version }}.zip` below
+            2. Unzip it
+            3. Open Chrome → `chrome://extensions/` → Enable Developer Mode
+            4. Click "Load unpacked" → select the unzipped folder
+            5. Get a free Gemini API key at [aistudio.google.com](https://aistudio.google.com/app/apikey)
+            6. Click the extension icon, paste your key, pick your language → Save
+          files: MangaLens-v${{ steps.version.outputs.version }}.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
