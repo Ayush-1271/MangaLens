@@ -3,7 +3,7 @@
 // 1. Fetching images from manga sites (CORS + Referer fix)
 // 2. Calling Gemini Vision API to OCR + translate image text
 
-const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent";
+const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "FETCH_IMAGE") {
