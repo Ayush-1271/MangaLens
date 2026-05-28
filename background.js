@@ -1,24 +1,14 @@
 // background.js
-// Service worker - handles two things:
-// 1. Fetching images from manga sites (CORS + Referer fix)
-// 2. Calling Gemini Vision API to OCR + translate image text
+// gemini-2.5-flash is the current free tier model (2.0 and 1.5 are retired)
 
-// Try models in order - gemini-1.5-flash has confirmed free tier globally
 const GEMINI_ENDPOINTS = [
-  "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent",
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
-  "https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent",
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent",
 ];
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type === "FETCH_IMAGE") {
-    fetchImage(msg.url, msg.pageUrl).then(sendResponse);
-    return true;
-  }
-  if (msg.type === "TRANSLATE_IMAGE") {
-    callGemini(msg).then(sendResponse);
-    return true;
-  }
+  if (msg.type === "FETCH_IMAGE") { fetchImage(msg.url, msg.pageUrl).then(sendResponse); return true; }
+  if (msg.type === "TRANSLATE_IMAGE") { callGemini(msg).then(sendResponse); return true; }
 });
 
 async function fetchImage(url, pageUrl) {
@@ -27,53 +17,38 @@ async function fetchImage(url, pageUrl) {
     let res = await fetch(url, { headers });
     if (!res.ok) res = await fetch(url);
     if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
-
     const blob = await res.blob();
-    if (blob.type && blob.type.includes("text")) return { ok: false, error: "Got HTML instead of image" };
-
+    if (blob.type && blob.type.includes("text")) return { ok: false, error: "Got HTML" };
     const bytes = new Uint8Array(await blob.arrayBuffer());
     const b64 = btoa(bytes.reduce((s, b) => s + String.fromCharCode(b), ""));
     return { ok: true, base64: b64, mimeType: blob.type || guessMime(url) };
   } catch (err) {
-    console.error("[MangaLens] fetch failed:", url, err.message);
     return { ok: false, error: err.message };
   }
 }
 
 function guessMime(url) {
-  if (url.includes(".png"))  return "image/png";
+  if (url.includes(".png")) return "image/png";
   if (url.includes(".webp")) return "image/webp";
-  if (url.includes(".gif"))  return "image/gif";
   return "image/jpeg";
 }
 
 async function callGemini({ base64, mimeType, targetLang, glossary, apiKey }) {
-  let glossaryHint = "";
-  if (glossary && Object.keys(glossary).length > 0) {
-    const entries = Object.entries(glossary).slice(0, 30);
-    glossaryHint = `\nKeep these translations consistent:\n${JSON.stringify(Object.fromEntries(entries))}`;
-  }
+  const glossaryHint = (glossary && Object.keys(glossary).length)
+    ? `\nKeep these translations consistent:\n${JSON.stringify(Object.fromEntries(Object.entries(glossary).slice(0,30)))}`
+    : "";
 
-  const prompt = `You are translating manga/manhwa image text to ${targetLang}.
+  const prompt = `Translate all text in this manga/manhwa image to ${targetLang}.${glossaryHint}
 
-Find ALL visible text: speech bubbles, thought bubbles, captions, narration boxes, sound effects, signs.
-${glossaryHint}
+Find: speech bubbles, thought bubbles, captions, narration boxes, sound effects, signs.
 
-Return ONLY a valid JSON array. No explanation, no markdown fences. If no text found, return [].
+Return ONLY a JSON array, no explanation, no markdown. Empty array [] if no text found.
 
-Each item:
-{
-  "original": "text as it appears",
-  "translated": "text translated to ${targetLang}",
-  "bbox": { "x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0 },
-  "bgColor": "#ffffff",
-  "isVertical": false,
-  "type": "speech_bubble"
-}
+Each item: {"original":"...","translated":"...","bbox":{"x":0.0,"y":0.0,"w":0.0,"h":0.0},"bgColor":"#ffffff","type":"speech_bubble"}
 
-bbox values are 0.0 to 1.0 fractions of image dimensions.`;
+bbox is 0.0-1.0 fraction of image size.`;
 
-  let lastError = "No model worked";
+  let lastError = "All models failed";
 
   for (const endpoint of GEMINI_ENDPOINTS) {
     try {
@@ -81,12 +56,7 @@ bbox values are 0.0 to 1.0 fractions of image dimensions.`;
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          contents: [{
-            parts: [
-              { text: prompt },
-              { inlineData: { mimeType, data: base64 } }
-            ]
-          }],
+          contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType, data: base64 } }] }],
           generationConfig: { temperature: 0.1, maxOutputTokens: 4096 }
         })
       });
@@ -94,27 +64,26 @@ bbox values are 0.0 to 1.0 fractions of image dimensions.`;
       const data = await res.json();
 
       if (!res.ok) {
-        const errMsg = data?.error?.message || "API error";
-        console.warn("[MangaLens] model failed:", endpoint.split("/models/")[1], "-", errMsg.slice(0, 80));
-        lastError = errMsg;
-        // if quota error, try next model; if auth error, stop
-        if (errMsg.includes("API_KEY") || errMsg.includes("invalid")) break;
-        continue;
+        lastError = data?.error?.message || "API error";
+        const modelName = endpoint.split("/models/")[1].split(":")[0];
+        console.warn(`[MangaLens] ${modelName} failed:`, lastError.slice(0, 100));
+        if (lastError.includes("API_KEY") || lastError.includes("invalid key")) break;
+        continue; // try next model
       }
 
-      // success!
       let raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || "[]";
       raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
       const regions = JSON.parse(raw);
-      console.log("[MangaLens] ✅ translated using", endpoint.split("/models/")[1].split(":")[0]);
+      const modelName = endpoint.split("/models/")[1].split(":")[0];
+      console.log(`[MangaLens] ✅ success with ${modelName}, regions: ${regions.length}`);
       return { ok: true, regions };
 
     } catch (err) {
-      console.warn("[MangaLens] endpoint error:", err.message);
       lastError = err.message;
+      console.warn("[MangaLens] endpoint error:", err.message);
     }
   }
 
-  console.error("[MangaLens] all models failed. Last error:", lastError);
+  console.error("[MangaLens] ❌ all models failed:", lastError);
   return { ok: false, error: lastError };
 }
