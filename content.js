@@ -1,67 +1,81 @@
 // content.js
-// Runs on every page. Finds manga images, translates the text inside them,
-// and replaces them with canvas elements showing the translated version.
+// Runs on every page. Finds manga images, sends them for translation,
+// replaces them with canvas overlays showing translated text.
 
-// skip images smaller than this (icons, avatars, buttons, etc.)
-const MIN_SIZE = 200;
-
-const DONE_ATTR    = "data-ml-done";
+const MIN_SIZE    = 200;   // ignore images smaller than this (icons, avatars)
+const DONE_ATTR   = "data-ml-done";
 const PENDING_ATTR = "data-ml-pending";
 
 let cfg = { apiKey: "", targetLang: "English", enabled: false };
+let observerStarted = false;
 
 init();
 
 async function init() {
   cfg = await loadSettings();
   if (!cfg.enabled || !cfg.apiKey) return;
-
   scanImages();
   watchForNewImages();
 }
 
-// popup can toggle the extension without reloading the page
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === "SETTINGS_UPDATED") {
-    cfg = msg.settings;
+chrome.runtime.onMessage.addListener((m) => {
+  if (m.type === "SETTINGS_UPDATED") {
+    cfg = m.settings;
     if (cfg.enabled && cfg.apiKey) {
       scanImages();
-      watchForNewImages();
+      if (!observerStarted) watchForNewImages();
     }
   }
 });
 
+// ── Image scanning ───────────────────────────────────────────
+
 function scanImages() {
+  // Standard img tags
   document.querySelectorAll(`img:not([${DONE_ATTR}]):not([${PENDING_ATTR}])`).forEach(queueImage);
+
+  // MangaDex and some readers use picture > source or load via data-src
+  document.querySelectorAll("picture img, [data-src]").forEach(el => {
+    if (el.tagName === "IMG" && !el.hasAttribute(DONE_ATTR) && !el.hasAttribute(PENDING_ATTR)) {
+      queueImage(el);
+    }
+  });
 }
 
 function queueImage(img) {
-  const w = img.naturalWidth  || img.width  || parseInt(img.getAttribute("width")  || "0");
-  const h = img.naturalHeight || img.height || parseInt(img.getAttribute("height") || "0");
+  // Natural dimensions might be 0 if not loaded yet — use layout size as fallback
+  const w = img.naturalWidth  || img.clientWidth  || parseInt(img.getAttribute("width")  || "0");
+  const h = img.naturalHeight || img.clientHeight || parseInt(img.getAttribute("height") || "0");
   if (w < MIN_SIZE || h < MIN_SIZE) return;
+
+  // Skip if no usable src
+  const src = img.currentSrc || img.src || img.getAttribute("data-src") || "";
+  if (!src || src.startsWith("data:") || src === window.location.href) return;
 
   img.setAttribute(PENDING_ATTR, "1");
 
-  if (img.complete) {
+  if (img.complete && img.naturalWidth > 0) {
     handleImage(img);
   } else {
     img.addEventListener("load", () => handleImage(img), { once: true });
+    // also set real src if only data-src is present (lazy load)
+    if (!img.src && img.dataset.src) img.src = img.dataset.src;
   }
 }
 
 async function handleImage(img) {
   const src = img.currentSrc || img.src;
   if (!src || src.startsWith("data:")) {
-    img.setAttribute(DONE_ATTR, "skip");
-    img.removeAttribute(PENDING_ATTR);
+    markDone(img, "skip");
     return;
   }
 
-  // fetch the image through the service worker (bypasses CORS)
-  const fetched = await msg({ type: "FETCH_IMAGE", url: src });
+  // Pass the page URL so background.js can set the correct Referer header
+  const fetched = await msg({ type: "FETCH_IMAGE", url: src, pageUrl: window.location.href });
+
   if (!fetched?.ok) {
-    img.setAttribute(DONE_ATTR, "fetch-err");
-    img.removeAttribute(PENDING_ATTR);
+    console.warn("[MangaLens] fetch failed for", src, fetched?.error);
+    markDone(img, "fetch-err");
     return;
   }
 
@@ -76,28 +90,42 @@ async function handleImage(img) {
     apiKey:     cfg.apiKey
   });
 
-  img.setAttribute(DONE_ATTR, "1");
-  img.removeAttribute(PENDING_ATTR);
+  markDone(img, "1");
 
-  if (!result?.ok || !result.regions?.length) return;
+  if (!result?.ok) {
+    console.warn("[MangaLens] translation failed:", result?.error);
+    return;
+  }
 
-  // save newly discovered terms for consistency on future pages
+  if (!result.regions?.length) return; // no text found — leave image as-is
+
   saveToGlossary(result.regions, glossary);
-
   drawTranslated(img, result.regions);
 }
+
+function markDone(img, val) {
+  img.setAttribute(DONE_ATTR, val);
+  img.removeAttribute(PENDING_ATTR);
+}
+
+// ── Canvas rendering ─────────────────────────────────────────
 
 function drawTranslated(img, regions) {
   const W = img.naturalWidth;
   const H = img.naturalHeight;
 
-  const canvas   = document.createElement("canvas");
-  canvas.width   = W;
-  canvas.height  = H;
-  canvas.style.cssText = img.style.cssText;
-  canvas.className     = img.className;
-  canvas.style.maxWidth  = "100%";
-  canvas.style.display   = "block";
+  const canvas  = document.createElement("canvas");
+  canvas.width  = W;
+  canvas.height = H;
+
+  // Copy computed styles so canvas slots in exactly like the original img
+  const computed = window.getComputedStyle(img);
+  canvas.style.cssText    = img.style.cssText;
+  canvas.style.width      = computed.width;
+  canvas.style.height     = computed.height;
+  canvas.style.maxWidth   = "100%";
+  canvas.style.display    = computed.display === "none" ? "block" : computed.display;
+  canvas.className        = img.className;
 
   const ctx = canvas.getContext("2d");
 
@@ -110,7 +138,9 @@ function drawTranslated(img, regions) {
       const w = Math.ceil(region.bbox.w  * W);
       const h = Math.ceil(region.bbox.h  * H);
 
-      // clear original text
+      if (w < 4 || h < 4) continue;
+
+      // Erase original text by filling the bubble region
       const bg = region.bgColor || "#ffffff";
       if (bg !== "transparent") {
         ctx.save();
@@ -120,7 +150,6 @@ function drawTranslated(img, regions) {
         ctx.restore();
       }
 
-      // draw translated text
       placeText(ctx, region.translated, x, y, w, h, region.type);
     }
   };
@@ -128,59 +157,67 @@ function drawTranslated(img, regions) {
   if (img.complete && img.naturalWidth > 0) {
     render();
   } else {
-    // shouldn't happen often but just in case
     const tmp = new Image();
     tmp.crossOrigin = "anonymous";
     tmp.onload = render;
-    tmp.src = src;
+    tmp.src = img.currentSrc || img.src;
   }
 
-  // wrap in a div so we can position the toggle button
+  // Wrap in a relative div so the toggle button can be absolutely positioned
   const wrap = document.createElement("div");
-  wrap.style.cssText = "position:relative; display:inline-block;";
+  wrap.style.cssText  = "position:relative; display:inline-block; line-height:0;";
+  wrap.style.width    = computed.width;
+  wrap.style.maxWidth = "100%";
+
   img.parentNode.insertBefore(wrap, img);
   wrap.appendChild(canvas);
-
   img.style.display = "none";
-  wrap.appendChild(img); // keep it in DOM for toggle
+  wrap.appendChild(img); // keep in DOM for toggle
 
   addToggle(wrap, canvas, img);
 }
 
+// ── Text placement ───────────────────────────────────────────
+
 function placeText(ctx, text, x, y, w, h, type) {
+  if (!text) return;
   ctx.save();
 
-  const pad = Math.max(4, Math.floor(w * 0.06));
+  const pad   = Math.max(3, Math.floor(Math.min(w, h) * 0.06));
   const isSFX = type === "sfx";
-  const font  = isSFX ? "'Impact', sans-serif" : "'Arial', sans-serif";
+  const font  = isSFX ? "'Impact', 'Arial Black', sans-serif" : "'Arial', 'Helvetica', sans-serif";
 
-  let fontSize = Math.min(h * 0.85, w * 0.9);
-  const minSize = 8;
-
-  // shrink font until text fits
+  // Find the largest font size where the text fits
+  let fontSize = Math.min(h * 0.85, w * 0.9, 32);
+  const minSize = 7;
   let lines = [];
-  while (fontSize > minSize) {
+
+  while (fontSize >= minSize) {
     ctx.font = `bold ${fontSize}px ${font}`;
     lines = wrapLines(ctx, text, w - pad * 2);
-    if (lines.length * fontSize * 1.25 <= h - pad * 2) break;
+    if (lines.length * fontSize * 1.3 <= h - pad * 2) break;
     fontSize -= 1;
   }
 
-  ctx.font = `bold ${fontSize}px ${font}`;
+  ctx.font         = `bold ${fontSize}px ${font}`;
   ctx.textAlign    = "center";
   ctx.textBaseline = "middle";
-  ctx.fillStyle    = "#111111";
-  ctx.shadowColor  = "rgba(255,255,255,0.85)";
-  ctx.shadowBlur   = 3;
+  ctx.fillStyle    = isSFX ? "#7c2d00" : "#111111";
 
-  const lineH  = fontSize * 1.25;
+  // White outline for readability
+  ctx.strokeStyle = "rgba(255,255,255,0.9)";
+  ctx.lineWidth   = 3;
+
+  const lineH  = fontSize * 1.3;
   const totalH = lines.length * lineH;
   const startY = y + (h - totalH) / 2 + lineH / 2;
   const midX   = x + w / 2;
 
-  lines.forEach((line, i) => {
-    ctx.fillText(line, midX, startY + i * lineH);
-  });
+  for (let i = 0; i < lines.length; i++) {
+    const ly = startY + i * lineH;
+    ctx.strokeText(lines[i], midX, ly);
+    ctx.fillText(lines[i], midX, ly);
+  }
 
   ctx.restore();
 }
@@ -189,7 +226,6 @@ function wrapLines(ctx, text, maxW) {
   const words = text.split(" ");
   const lines = [];
   let cur = "";
-
   for (const word of words) {
     const test = cur ? `${cur} ${word}` : word;
     if (ctx.measureText(test).width > maxW && cur) {
@@ -200,10 +236,11 @@ function wrapLines(ctx, text, maxW) {
     }
   }
   if (cur) lines.push(cur);
-  return lines;
+  return lines.length ? lines : [text];
 }
 
 function bubbleRect(ctx, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
   ctx.beginPath();
   ctx.moveTo(x + r, y);
   ctx.lineTo(x + w - r, y);
@@ -217,7 +254,8 @@ function bubbleRect(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
-// little "show original" button on hover
+// ── "Show original" hover button ─────────────────────────────
+
 function addToggle(wrap, canvas, img) {
   let showingOriginal = false;
 
@@ -225,10 +263,10 @@ function addToggle(wrap, canvas, img) {
   btn.textContent = "👁 Original";
   btn.style.cssText = `
     position:absolute; top:6px; right:6px;
-    background:rgba(0,0,0,0.6); color:#fff; border:none;
-    padding:3px 8px; border-radius:4px; cursor:pointer;
-    font-size:11px; font-family:sans-serif;
-    opacity:0; transition:opacity 0.15s; pointer-events:auto;
+    background:rgba(0,0,0,0.65); color:#fff; border:none; border-radius:4px;
+    padding:3px 9px; cursor:pointer; font-size:11px; font-family:sans-serif;
+    opacity:0; transition:opacity 0.15s; pointer-events:auto; z-index:999;
+    line-height:1.5;
   `;
   wrap.appendChild(btn);
 
@@ -238,45 +276,51 @@ function addToggle(wrap, canvas, img) {
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
     showingOriginal = !showingOriginal;
-    canvas.style.display = showingOriginal ? "none"  : "block";
-    img.style.display    = showingOriginal ? "block" : "none";
+    canvas.style.display = showingOriginal ? "none"  : "";
+    img.style.display    = showingOriginal ? ""      : "none";
     btn.textContent      = showingOriginal ? "✨ Translated" : "👁 Original";
   });
 }
 
-// watch for images that load after the initial page render (lazy-loaded readers)
+// ── MutationObserver — catches lazy-loaded images ─────────────
+
 function watchForNewImages() {
+  observerStarted = true;
   const observer = new MutationObserver(mutations => {
     for (const m of mutations) {
+      // New nodes added (e.g. reader loads next page)
       for (const node of m.addedNodes) {
+        if (node.nodeType !== 1) continue;
         if (node.tagName === "IMG") queueImage(node);
-        if (node.querySelectorAll) {
-          node.querySelectorAll(`img:not([${DONE_ATTR}]):not([${PENDING_ATTR}])`).forEach(queueImage);
-        }
+        node.querySelectorAll?.(`img:not([${DONE_ATTR}]):not([${PENDING_ATTR}])`).forEach(queueImage);
       }
-      // handle lazy loaders that swap the src attribute
-      if (m.type === "attributes" && m.target.tagName === "IMG" && m.attributeName === "src") {
-        const target = m.target;
-        if (!target.hasAttribute(DONE_ATTR) && !target.hasAttribute(PENDING_ATTR)) {
-          queueImage(target);
-        }
+      // src attribute swapped (lazy loaders)
+      if (m.type === "attributes" && m.target.tagName === "IMG"
+          && (m.attributeName === "src" || m.attributeName === "data-src")) {
+        const t = m.target;
+        if (!t.hasAttribute(DONE_ATTR) && !t.hasAttribute(PENDING_ATTR)) queueImage(t);
       }
     }
   });
 
   observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-    attributes: true,
-    attributeFilter: ["src"]
+    childList:   true,
+    subtree:     true,
+    attributes:  true,
+    attributeFilter: ["src", "data-src", "srcset"]
   });
 }
 
-// storage helpers
+// ── Storage helpers ───────────────────────────────────────────
+
 function loadSettings() {
   return new Promise(res => {
     chrome.storage.sync.get(["apiKey", "targetLang", "enabled"], d => {
-      res({ apiKey: d.apiKey || "", targetLang: d.targetLang || "English", enabled: d.enabled !== false });
+      res({
+        apiKey:     d.apiKey     || "",
+        targetLang: d.targetLang || "English",
+        enabled:    d.enabled    !== false
+      });
     });
   });
 }
