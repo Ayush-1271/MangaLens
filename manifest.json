@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MangaLens",
-  "version": "1.0.0",
+  "version": "1.0.8",
   "description": "Translates text inside manga and manhwa images using Gemini Vision. Works where Google Translate doesn't.",
   "permissions": [
     "storage",
