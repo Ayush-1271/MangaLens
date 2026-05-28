@@ -1,22 +1,25 @@
 // content.js
-const MIN_SIZE     = 300;   // only process real manga pages, not UI thumbnails
+const MIN_SIZE     = 300;
 const DONE_ATTR    = "data-ml-done";
 const PENDING_ATTR = "data-ml-pending";
-const MAX_SEND_PX  = 800;   // downscale to this width before sending — saves ~70% tokens
+const MAX_SEND_PX  = 800;
 const CACHE_PREFIX = "mlcache:";
-const MAX_QUEUE    = 3;     // max concurrent API calls at once
+
+// Only 1 request at a time + 4s gap = max 15/min, respecting free tier
+const CALL_INTERVAL_MS = 4000;
+let lastCallTime = 0;
+let queue = [];
+let processing = false;
 
 let cfg = { apiKey: "", targetLang: "English", enabled: false };
 let observerStarted = false;
-let queue = [];
-let running = 0;
 
 init();
 
 async function init() {
   cfg = await loadSettings();
   if (!cfg.enabled || !cfg.apiKey) return;
-  watchForVisibleImages(); // only translate what user actually sees
+  watchForVisibleImages();
   watchForNewImages();
 }
 
@@ -30,7 +33,7 @@ chrome.runtime.onMessage.addListener((m) => {
   }
 });
 
-// ── Only process images that enter the viewport ──────────────
+// ── Only process images that scroll into view ─────────────────
 function watchForVisibleImages() {
   const io = new IntersectionObserver(entries => {
     for (const entry of entries) {
@@ -39,19 +42,18 @@ function watchForVisibleImages() {
         if (!img.hasAttribute(DONE_ATTR) && !img.hasAttribute(PENDING_ATTR)) {
           queueImage(img);
         }
-        io.unobserve(img); // stop watching once queued
+        io.unobserve(img);
       }
     }
-  }, { rootMargin: "200px" }); // start 200px before visible
+  }, { rootMargin: "300px" }); // start loading 300px before visible
 
-  // observe all existing large images
   document.querySelectorAll(`img:not([${DONE_ATTR}]):not([${PENDING_ATTR}])`).forEach(img => {
     const w = img.naturalWidth  || img.clientWidth  || 0;
     const h = img.naturalHeight || img.clientHeight || 0;
     if (w >= MIN_SIZE && h >= MIN_SIZE) io.observe(img);
   });
 
-  window._mangaLensIO = io; // save for watchForNewImages to reuse
+  window._mangaLensIO = io;
 }
 
 function queueImage(img) {
@@ -64,52 +66,67 @@ function queueImage(img) {
   if (w < MIN_SIZE || h < MIN_SIZE) return;
 
   img.setAttribute(PENDING_ATTR, "1");
+  showStatus(img, "⏳");
 
-  const process = () => {
-    if (img.complete && img.naturalWidth > 0) {
-      enqueue(img);
-    } else {
-      img.addEventListener("load", () => enqueue(img), { once: true });
-    }
-  };
-  process();
+  if (img.complete && img.naturalWidth > 0) {
+    enqueue(img);
+  } else {
+    img.addEventListener("load", () => enqueue(img), { once: true });
+  }
 }
 
-// ── Concurrency-limited queue ─────────────────────────────────
 function enqueue(img) {
   queue.push(img);
-  drain();
+  if (!processing) drainQueue();
 }
 
-function drain() {
-  while (running < MAX_QUEUE && queue.length > 0) {
+// ── Serial queue with rate limiting ──────────────────────────
+async function drainQueue() {
+  processing = true;
+  while (queue.length > 0) {
+    // Wait until enough time has passed since last call
+    const now = Date.now();
+    const wait = CALL_INTERVAL_MS - (now - lastCallTime);
+    if (wait > 0) {
+      await sleep(wait);
+    }
     const img = queue.shift();
-    running++;
-    handleImage(img).finally(() => { running--; drain(); });
+    // Skip if already processed while waiting
+    if (img.hasAttribute(DONE_ATTR)) continue;
+    lastCallTime = Date.now();
+    await handleImage(img);
   }
+  processing = false;
 }
 
 async function handleImage(img) {
   const src = img.currentSrc || img.src;
   if (!src || src.startsWith("data:")) { markDone(img, "skip"); return; }
 
-  // ── Check cache first ────────────────────────────────────────
+  // Check cache
   const cacheKey = await getCacheKey(img, src);
   const cached   = await getCache(cacheKey);
   if (cached) {
-    console.log("[MangaLens] cache hit:", cacheKey.slice(0, 40));
+    console.log("[MangaLens] cache hit");
     markDone(img, "cached");
+    clearStatus(img);
     if (cached.regions?.length) drawTranslated(img, cached.regions);
     return;
   }
 
-  // ── Fetch + downscale ────────────────────────────────────────
-  const fetched = await msg({ type: "FETCH_IMAGE", url: src, pageUrl: window.location.href });
-  if (!fetched?.ok) { markDone(img, "fetch-err"); return; }
+  showStatus(img, "🔄");
 
-  // Downscale on canvas before sending — massive token savings
+  const fetched = await msg({ type: "FETCH_IMAGE", url: src, pageUrl: window.location.href });
+  if (!fetched?.ok) {
+    console.error("[MangaLens] fetch failed:", fetched?.error);
+    markDone(img, "fetch-err");
+    showStatus(img, "❌ fetch");
+    return;
+  }
+
+  // Downscale before sending
   const { base64, mimeType } = await downscale(img, fetched.base64, fetched.mimeType);
-  console.log(`[MangaLens] sending ${(base64.length * 0.75 / 1024).toFixed(0)}KB (downscaled from ${(fetched.base64.length * 0.75 / 1024).toFixed(0)}KB)`);
+  console.log(`[MangaLens] sending ${(base64.length * 0.75 / 1024).toFixed(0)}KB`);
 
   const glossary = await loadGlossary();
   const result = await msg({
@@ -120,114 +137,124 @@ async function handleImage(img) {
     apiKey: cfg.apiKey
   });
 
-  markDone(img, "1");
-
   if (!result?.ok) {
     console.error("[MangaLens] ❌ Gemini failed:", result?.error);
+
+    // If rate limited, put back in queue to retry after a longer wait
+    if (result?.error?.includes("429") || result?.error?.includes("quota") || result?.error?.includes("exceeded")) {
+      console.log("[MangaLens] Rate limited — will retry in 30s");
+      showStatus(img, "⏳ retry");
+      img.removeAttribute(DONE_ATTR);
+      img.removeAttribute(PENDING_ATTR);
+      await sleep(30000);
+      enqueue(img);
+    } else {
+      markDone(img, "err");
+      showStatus(img, "❌");
+    }
     return;
   }
 
-  console.log("[MangaLens] ✅ translated, regions:", result.regions?.length);
-  if (!result.regions?.length) { await saveCache(cacheKey, { regions: [] }); return; }
+  markDone(img, "1");
+  clearStatus(img);
+  console.log("[MangaLens] ✅ regions:", result.regions?.length);
+
+  if (!result.regions?.length) {
+    await saveCache(cacheKey, { regions: [] });
+    return;
+  }
 
   saveToGlossary(result.regions, glossary);
   await saveCache(cacheKey, { regions: result.regions });
   drawTranslated(img, result.regions);
 }
 
-// ── Downscale image to MAX_SEND_PX wide using canvas ─────────
+// ── Status badge on image ─────────────────────────────────────
+function showStatus(img, text) {
+  const id = "ml-status-" + Math.random().toString(36).slice(2);
+  img.dataset.mlStatusId = id;
+  // Remove old status if any
+  const old = document.getElementById(img.dataset.mlStatusId);
+  if (old) old.remove();
+
+  const badge = document.createElement("div");
+  badge.id = id;
+  badge.textContent = text;
+  badge.style.cssText = `position:absolute;top:8px;left:8px;background:rgba(0,0,0,0.7);
+    color:white;padding:3px 8px;border-radius:4px;font-size:12px;
+    font-family:sans-serif;z-index:9999;pointer-events:none;`;
+
+  // Try to position relative to the image
+  const wrap = img.closest("[style*='position:relative']") || img.parentElement;
+  if (wrap) {
+    if (getComputedStyle(wrap).position === "static") wrap.style.position = "relative";
+    wrap.appendChild(badge);
+  }
+}
+
+function clearStatus(img) {
+  const id = img.dataset.mlStatusId;
+  if (id) { const el = document.getElementById(id); if (el) el.remove(); }
+}
+
+// ── Downscale ─────────────────────────────────────────────────
 function downscale(img, base64, mimeType) {
   return new Promise(resolve => {
-    const W = img.naturalWidth;
-    const H = img.naturalHeight;
-
-    // if already small enough, send as-is
+    const W = img.naturalWidth, H = img.naturalHeight;
     if (W <= MAX_SEND_PX) { resolve({ base64, mimeType }); return; }
-
-    const scale  = MAX_SEND_PX / W;
-    const newW   = MAX_SEND_PX;
-    const newH   = Math.round(H * scale);
-
-    const canvas  = document.createElement("canvas");
-    canvas.width  = newW;
-    canvas.height = newH;
+    const scale = MAX_SEND_PX / W;
+    const canvas = document.createElement("canvas");
+    canvas.width  = MAX_SEND_PX;
+    canvas.height = Math.round(H * scale);
     const ctx = canvas.getContext("2d");
-
     const tmp = new Image();
     tmp.onload = () => {
-      ctx.drawImage(tmp, 0, 0, newW, newH);
-      // JPEG at 0.75 quality — enough for text, much smaller than PNG
-      const dataUrl  = canvas.toDataURL("image/jpeg", 0.75);
-      const newBase64 = dataUrl.split(",")[1];
-      resolve({ base64: newBase64, mimeType: "image/jpeg" });
+      ctx.drawImage(tmp, 0, 0, canvas.width, canvas.height);
+      const b64 = canvas.toDataURL("image/jpeg", 0.75).split(",")[1];
+      resolve({ base64: b64, mimeType: "image/jpeg" });
     };
-    tmp.onerror = () => resolve({ base64, mimeType }); // fallback to original
+    tmp.onerror = () => resolve({ base64, mimeType });
     tmp.src = `data:${mimeType};base64,${base64}`;
   });
 }
 
-// ── Cache helpers ─────────────────────────────────────────────
+// ── Cache ─────────────────────────────────────────────────────
 async function getCacheKey(img, src) {
-  // For blob URLs (MangaDex), use chapter URL + img index as key
   if (src.startsWith("blob:")) {
-    const imgs   = Array.from(document.querySelectorAll("img"));
-    const index  = imgs.indexOf(img);
+    const imgs    = Array.from(document.querySelectorAll("img"));
+    const index   = imgs.indexOf(img);
     const chapter = window.location.pathname.replace(/\//g, "-");
     return CACHE_PREFIX + chapter + "-" + index;
   }
-  // For regular URLs, use the URL itself
   return CACHE_PREFIX + src.replace(/[^a-z0-9]/gi, "").slice(-80);
 }
-
-async function getCache(key) {
-  return new Promise(res => chrome.storage.local.get(key, d => res(d[key] || null)));
-}
-
-async function saveCache(key, value) {
-  return new Promise(res => chrome.storage.local.set({ [key]: value }, res));
-}
-
-function markDone(img, val) {
-  img.setAttribute(DONE_ATTR, val);
-  img.removeAttribute(PENDING_ATTR);
-}
+function getCache(key)        { return new Promise(r => chrome.storage.local.get(key, d => r(d[key] || null))); }
+function saveCache(key, val)  { return new Promise(r => chrome.storage.local.set({ [key]: val }, r)); }
 
 // ── Canvas rendering ─────────────────────────────────────────
-
 function drawTranslated(img, regions) {
-  const W = img.naturalWidth;
-  const H = img.naturalHeight;
-
-  const canvas  = document.createElement("canvas");
-  canvas.width  = W;
-  canvas.height = H;
-
+  const W = img.naturalWidth, H = img.naturalHeight;
+  const canvas = document.createElement("canvas");
+  canvas.width  = W; canvas.height = H;
   const computed = window.getComputedStyle(img);
-  canvas.style.cssText  = img.style.cssText;
-  canvas.style.width    = computed.width;
-  canvas.style.height   = computed.height;
+  canvas.style.cssText = img.style.cssText;
+  canvas.style.width   = computed.width;
+  canvas.style.height  = computed.height;
   canvas.style.maxWidth = "100%";
-  canvas.style.display  = "block";
-  canvas.className      = img.className;
-
+  canvas.style.display = "block";
+  canvas.className     = img.className;
   const ctx = canvas.getContext("2d");
 
   const render = () => {
     ctx.drawImage(img, 0, 0, W, H);
     for (const region of regions) {
-      const x = Math.floor(region.bbox.x * W);
-      const y = Math.floor(region.bbox.y * H);
-      const w = Math.ceil(region.bbox.w  * W);
-      const h = Math.ceil(region.bbox.h  * H);
+      const x = Math.floor(region.bbox.x * W), y = Math.floor(region.bbox.y * H);
+      const w = Math.ceil(region.bbox.w  * W), h = Math.ceil(region.bbox.h  * H);
       if (w < 4 || h < 4) continue;
-
       const bg = region.bgColor || "#ffffff";
       if (bg !== "transparent") {
-        ctx.save();
-        ctx.fillStyle = bg;
-        bubbleRect(ctx, x, y, w, h, 5);
-        ctx.fill();
-        ctx.restore();
+        ctx.save(); ctx.fillStyle = bg;
+        bubbleRect(ctx, x, y, w, h, 5); ctx.fill(); ctx.restore();
       }
       placeText(ctx, region.translated, x, y, w, h, region.type);
     }
@@ -240,7 +267,6 @@ function drawTranslated(img, regions) {
   wrap.style.cssText  = "position:relative; display:inline-block; line-height:0;";
   wrap.style.width    = computed.width;
   wrap.style.maxWidth = "100%";
-
   img.parentNode.insertBefore(wrap, img);
   wrap.appendChild(canvas);
   img.style.display = "none";
@@ -251,11 +277,10 @@ function drawTranslated(img, regions) {
 function placeText(ctx, text, x, y, w, h, type) {
   if (!text) return;
   ctx.save();
-  const pad   = Math.max(3, Math.floor(Math.min(w, h) * 0.06));
+  const pad = Math.max(3, Math.floor(Math.min(w, h) * 0.06));
   const isSFX = type === "sfx";
-  const font  = isSFX ? "'Impact', 'Arial Black', sans-serif" : "'Arial', sans-serif";
-  let fontSize = Math.min(h * 0.85, w * 0.9, 32);
-  const minSize = 7;
+  const font  = isSFX ? "'Impact','Arial Black',sans-serif" : "'Arial',sans-serif";
+  let fontSize = Math.min(h * 0.85, w * 0.9, 32), minSize = 7;
   let lines = [];
   while (fontSize >= minSize) {
     ctx.font = `bold ${fontSize}px ${font}`;
@@ -263,16 +288,12 @@ function placeText(ctx, text, x, y, w, h, type) {
     if (lines.length * fontSize * 1.3 <= h - pad * 2) break;
     fontSize -= 1;
   }
-  ctx.font         = `bold ${fontSize}px ${font}`;
-  ctx.textAlign    = "center";
-  ctx.textBaseline = "middle";
-  ctx.strokeStyle  = "rgba(255,255,255,0.95)";
-  ctx.lineWidth    = 3;
-  ctx.fillStyle    = isSFX ? "#7c2d00" : "#111111";
-  const lineH  = fontSize * 1.3;
-  const totalH = lines.length * lineH;
-  const startY = y + (h - totalH) / 2 + lineH / 2;
-  const midX   = x + w / 2;
+  ctx.font = `bold ${fontSize}px ${font}`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.strokeStyle = "rgba(255,255,255,0.95)"; ctx.lineWidth = 3;
+  ctx.fillStyle = isSFX ? "#7c2d00" : "#111111";
+  const lineH = fontSize * 1.3, totalH = lines.length * lineH;
+  const startY = y + (h - totalH) / 2 + lineH / 2, midX = x + w / 2;
   for (let i = 0; i < lines.length; i++) {
     ctx.strokeText(lines[i], midX, startY + i * lineH);
     ctx.fillText(lines[i], midX, startY + i * lineH);
@@ -281,8 +302,7 @@ function placeText(ctx, text, x, y, w, h, type) {
 }
 
 function wrapLines(ctx, text, maxW) {
-  const words = text.split(" ");
-  const lines = [];
+  const words = text.split(" "), lines = [];
   let cur = "";
   for (const word of words) {
     const test = cur ? `${cur} ${word}` : word;
@@ -294,32 +314,26 @@ function wrapLines(ctx, text, maxW) {
 }
 
 function bubbleRect(ctx, x, y, w, h, r) {
-  r = Math.min(r, w / 2, h / 2);
+  r = Math.min(r, w/2, h/2);
   ctx.beginPath();
-  ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y);
-  ctx.quadraticCurveTo(x + w, y,     x + w, y + r);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-  ctx.lineTo(x + r, y + h);
-  ctx.quadraticCurveTo(x, y + h,     x, y + h - r);
-  ctx.lineTo(x, y + r);
-  ctx.quadraticCurveTo(x, y,         x + r, y);
-  ctx.closePath();
+  ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y); ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+  ctx.lineTo(x+w,y+h-r); ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+  ctx.lineTo(x+r,y+h); ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+  ctx.lineTo(x,y+r); ctx.quadraticCurveTo(x,y,x+r,y); ctx.closePath();
 }
 
 function addToggle(wrap, canvas, img) {
   let orig = false;
   const btn = document.createElement("button");
   btn.textContent = "👁 Original";
-  btn.style.cssText = `position:absolute;top:6px;right:6px;background:rgba(0,0,0,0.65);color:#fff;
-    border:none;border-radius:4px;padding:3px 9px;cursor:pointer;font-size:11px;
-    font-family:sans-serif;opacity:0;transition:opacity 0.15s;z-index:9999;line-height:1.5;`;
+  btn.style.cssText = `position:absolute;top:6px;right:6px;background:rgba(0,0,0,0.65);
+    color:#fff;border:none;border-radius:4px;padding:3px 9px;cursor:pointer;
+    font-size:11px;font-family:sans-serif;opacity:0;transition:opacity 0.15s;z-index:9999;`;
   wrap.appendChild(btn);
   wrap.addEventListener("mouseenter", () => btn.style.opacity = "1");
   wrap.addEventListener("mouseleave", () => btn.style.opacity = "0");
   btn.addEventListener("click", e => {
-    e.stopPropagation();
-    orig = !orig;
+    e.stopPropagation(); orig = !orig;
     canvas.style.display = orig ? "none" : "block";
     img.style.display    = orig ? "block" : "none";
     btn.textContent      = orig ? "✨ Translated" : "👁 Original";
@@ -329,13 +343,13 @@ function addToggle(wrap, canvas, img) {
 function watchForNewImages() {
   observerStarted = true;
   const io = window._mangaLensIO;
-  const observer = new MutationObserver(mutations => {
+  new MutationObserver(mutations => {
     for (const m of mutations) {
       for (const node of m.addedNodes) {
         if (node.nodeType !== 1) continue;
         const imgs = node.tagName === "IMG" ? [node] : [...(node.querySelectorAll?.("img") || [])];
         for (const img of imgs) {
-          const w = img.naturalWidth  || img.clientWidth  || 0;
+          const w = img.naturalWidth || img.clientWidth || 0;
           const h = img.naturalHeight || img.clientHeight || 0;
           if (w >= MIN_SIZE && h >= MIN_SIZE && !img.hasAttribute(DONE_ATTR) && !img.hasAttribute(PENDING_ATTR)) {
             io ? io.observe(img) : queueImage(img);
@@ -343,23 +357,16 @@ function watchForNewImages() {
         }
       }
     }
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
+  }).observe(document.body, { childList: true, subtree: true });
 }
 
-function loadSettings() {
-  return new Promise(res => chrome.storage.sync.get(["apiKey", "targetLang", "enabled"], d => {
-    res({ apiKey: d.apiKey || "", targetLang: d.targetLang || "English", enabled: d.enabled !== false });
-  }));
-}
-function loadGlossary() {
-  return new Promise(res => chrome.storage.local.get("glossary", d => res(d.glossary || {})));
-}
+function markDone(img, val) { img.setAttribute(DONE_ATTR, val); img.removeAttribute(PENDING_ATTR); }
+function sleep(ms)          { return new Promise(r => setTimeout(r, ms)); }
+function loadSettings()     { return new Promise(r => chrome.storage.sync.get(["apiKey","targetLang","enabled"], d => r({ apiKey: d.apiKey||"", targetLang: d.targetLang||"English", enabled: d.enabled!==false }))); }
+function loadGlossary()     { return new Promise(r => chrome.storage.local.get("glossary", d => r(d.glossary||{}))); }
 function saveToGlossary(regions, existing) {
   const u = { ...existing };
   for (const r of regions) { if (r.original && r.translated && !u[r.original]) u[r.original] = r.translated; }
   chrome.storage.local.set({ glossary: u });
 }
-function msg(payload) {
-  return new Promise(res => chrome.runtime.sendMessage(payload, res));
-}
+function msg(payload) { return new Promise(r => chrome.runtime.sendMessage(payload, r)); }
