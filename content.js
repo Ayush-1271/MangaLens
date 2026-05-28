@@ -43,6 +43,13 @@ function queueImage(img) {
   const src = img.currentSrc || img.src || img.getAttribute("data-src") || "";
 
   if (!src || src.startsWith("data:") || src === window.location.href) return;
+
+  // Skip SVGs — they're icons, flags, logos, never manga content
+  if (src.includes(".svg") || src.includes("image/svg")) return;
+
+  // Skip tiny images that passed the pixel check but are clearly not manga
+  // (flags can be 150x150 which passes MIN_SIZE=150)
+  if ((w <= 200 && h <= 200) && !src.includes("uploads.") && !src.includes("cdn.")) return;
   if (w < MIN_SIZE || h < MIN_SIZE) {
     return;
   }
