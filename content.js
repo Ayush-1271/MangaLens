@@ -1,18 +1,22 @@
 // content.js
-const MIN_SIZE     = 150;
+const MIN_SIZE     = 300;   // only process real manga pages, not UI thumbnails
 const DONE_ATTR    = "data-ml-done";
 const PENDING_ATTR = "data-ml-pending";
+const MAX_SEND_PX  = 800;   // downscale to this width before sending — saves ~70% tokens
+const CACHE_PREFIX = "mlcache:";
+const MAX_QUEUE    = 3;     // max concurrent API calls at once
 
 let cfg = { apiKey: "", targetLang: "English", enabled: false };
 let observerStarted = false;
+let queue = [];
+let running = 0;
 
 init();
 
 async function init() {
   cfg = await loadSettings();
-  console.log("[MangaLens] init — enabled:", cfg.enabled, "hasKey:", !!cfg.apiKey);
   if (!cfg.enabled || !cfg.apiKey) return;
-  scanImages();
+  watchForVisibleImages(); // only translate what user actually sees
   watchForNewImages();
 }
 
@@ -20,48 +24,68 @@ chrome.runtime.onMessage.addListener((m) => {
   if (m.type === "SETTINGS_UPDATED") {
     cfg = m.settings;
     if (cfg.enabled && cfg.apiKey) {
-      scanImages();
+      watchForVisibleImages();
       if (!observerStarted) watchForNewImages();
     }
   }
-  if (m.type === "SCAN_NOW") {
-    console.log("[MangaLens] manual scan triggered");
-    scanImages();
-  }
 });
 
-function scanImages() {
-  const all = document.querySelectorAll(`img:not([${DONE_ATTR}]):not([${PENDING_ATTR}])`);
-  console.log(`[MangaLens] scanning — found ${all.length} unprocessed img tags`);
-  all.forEach(queueImage);
+// ── Only process images that enter the viewport ──────────────
+function watchForVisibleImages() {
+  const io = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) {
+        const img = entry.target;
+        if (!img.hasAttribute(DONE_ATTR) && !img.hasAttribute(PENDING_ATTR)) {
+          queueImage(img);
+        }
+        io.unobserve(img); // stop watching once queued
+      }
+    }
+  }, { rootMargin: "200px" }); // start 200px before visible
+
+  // observe all existing large images
+  document.querySelectorAll(`img:not([${DONE_ATTR}]):not([${PENDING_ATTR}])`).forEach(img => {
+    const w = img.naturalWidth  || img.clientWidth  || 0;
+    const h = img.naturalHeight || img.clientHeight || 0;
+    if (w >= MIN_SIZE && h >= MIN_SIZE) io.observe(img);
+  });
+
+  window._mangaLensIO = io; // save for watchForNewImages to reuse
 }
 
 function queueImage(img) {
-  const w = img.naturalWidth  || img.clientWidth  || parseInt(img.getAttribute("width")  || "0");
-  const h = img.naturalHeight || img.clientHeight || parseInt(img.getAttribute("height") || "0");
-
   const src = img.currentSrc || img.src || img.getAttribute("data-src") || "";
+  const w   = img.naturalWidth  || img.clientWidth  || 0;
+  const h   = img.naturalHeight || img.clientHeight || 0;
 
   if (!src || src.startsWith("data:") || src === window.location.href) return;
+  if (src.endsWith(".svg") || src.includes(".svg?") || src.includes("svg+xml")) return;
+  if (w < MIN_SIZE || h < MIN_SIZE) return;
 
-  // Skip SVGs — they're icons, flags, logos, never manga content
-  if (src.includes(".svg") || src.includes("image/svg")) return;
-
-  // Skip tiny images that passed the pixel check but are clearly not manga
-  // (flags can be 150x150 which passes MIN_SIZE=150)
-  if ((w <= 200 && h <= 200) && !src.includes("uploads.") && !src.includes("cdn.")) return;
-  if (w < MIN_SIZE || h < MIN_SIZE) {
-    return;
-  }
-
-  console.log(`[MangaLens] queuing ${w}x${h} — ${src.slice(0, 80)}`);
   img.setAttribute(PENDING_ATTR, "1");
 
-  if (img.complete && img.naturalWidth > 0) {
-    handleImage(img);
-  } else {
-    img.addEventListener("load", () => handleImage(img), { once: true });
-    if (!img.src && img.dataset.src) img.src = img.dataset.src;
+  const process = () => {
+    if (img.complete && img.naturalWidth > 0) {
+      enqueue(img);
+    } else {
+      img.addEventListener("load", () => enqueue(img), { once: true });
+    }
+  };
+  process();
+}
+
+// ── Concurrency-limited queue ─────────────────────────────────
+function enqueue(img) {
+  queue.push(img);
+  drain();
+}
+
+function drain() {
+  while (running < MAX_QUEUE && queue.length > 0) {
+    const img = queue.shift();
+    running++;
+    handleImage(img).finally(() => { running--; drain(); });
   }
 }
 
@@ -69,23 +93,28 @@ async function handleImage(img) {
   const src = img.currentSrc || img.src;
   if (!src || src.startsWith("data:")) { markDone(img, "skip"); return; }
 
-  console.log("[MangaLens] fetching:", src.slice(0, 80));
-
-  const fetched = await msg({ type: "FETCH_IMAGE", url: src, pageUrl: window.location.href });
-
-  if (!fetched?.ok) {
-    console.error("[MangaLens] ❌ fetch failed:", fetched?.error, "url:", src.slice(0, 80));
-    markDone(img, "fetch-err");
+  // ── Check cache first ────────────────────────────────────────
+  const cacheKey = await getCacheKey(img, src);
+  const cached   = await getCache(cacheKey);
+  if (cached) {
+    console.log("[MangaLens] cache hit:", cacheKey.slice(0, 40));
+    markDone(img, "cached");
+    if (cached.regions?.length) drawTranslated(img, cached.regions);
     return;
   }
 
-  console.log("[MangaLens] ✅ fetched, size:", fetched.base64.length, "mime:", fetched.mimeType);
+  // ── Fetch + downscale ────────────────────────────────────────
+  const fetched = await msg({ type: "FETCH_IMAGE", url: src, pageUrl: window.location.href });
+  if (!fetched?.ok) { markDone(img, "fetch-err"); return; }
+
+  // Downscale on canvas before sending — massive token savings
+  const { base64, mimeType } = await downscale(img, fetched.base64, fetched.mimeType);
+  console.log(`[MangaLens] sending ${(base64.length * 0.75 / 1024).toFixed(0)}KB (downscaled from ${(fetched.base64.length * 0.75 / 1024).toFixed(0)}KB)`);
 
   const glossary = await loadGlossary();
   const result = await msg({
     type: "TRANSLATE_IMAGE",
-    base64: fetched.base64,
-    mimeType: fetched.mimeType,
+    base64, mimeType,
     targetLang: cfg.targetLang,
     glossary,
     apiKey: cfg.apiKey
@@ -99,10 +128,63 @@ async function handleImage(img) {
   }
 
   console.log("[MangaLens] ✅ translated, regions:", result.regions?.length);
-  if (!result.regions?.length) return;
+  if (!result.regions?.length) { await saveCache(cacheKey, { regions: [] }); return; }
 
   saveToGlossary(result.regions, glossary);
+  await saveCache(cacheKey, { regions: result.regions });
   drawTranslated(img, result.regions);
+}
+
+// ── Downscale image to MAX_SEND_PX wide using canvas ─────────
+function downscale(img, base64, mimeType) {
+  return new Promise(resolve => {
+    const W = img.naturalWidth;
+    const H = img.naturalHeight;
+
+    // if already small enough, send as-is
+    if (W <= MAX_SEND_PX) { resolve({ base64, mimeType }); return; }
+
+    const scale  = MAX_SEND_PX / W;
+    const newW   = MAX_SEND_PX;
+    const newH   = Math.round(H * scale);
+
+    const canvas  = document.createElement("canvas");
+    canvas.width  = newW;
+    canvas.height = newH;
+    const ctx = canvas.getContext("2d");
+
+    const tmp = new Image();
+    tmp.onload = () => {
+      ctx.drawImage(tmp, 0, 0, newW, newH);
+      // JPEG at 0.75 quality — enough for text, much smaller than PNG
+      const dataUrl  = canvas.toDataURL("image/jpeg", 0.75);
+      const newBase64 = dataUrl.split(",")[1];
+      resolve({ base64: newBase64, mimeType: "image/jpeg" });
+    };
+    tmp.onerror = () => resolve({ base64, mimeType }); // fallback to original
+    tmp.src = `data:${mimeType};base64,${base64}`;
+  });
+}
+
+// ── Cache helpers ─────────────────────────────────────────────
+async function getCacheKey(img, src) {
+  // For blob URLs (MangaDex), use chapter URL + img index as key
+  if (src.startsWith("blob:")) {
+    const imgs   = Array.from(document.querySelectorAll("img"));
+    const index  = imgs.indexOf(img);
+    const chapter = window.location.pathname.replace(/\//g, "-");
+    return CACHE_PREFIX + chapter + "-" + index;
+  }
+  // For regular URLs, use the URL itself
+  return CACHE_PREFIX + src.replace(/[^a-z0-9]/gi, "").slice(-80);
+}
+
+async function getCache(key) {
+  return new Promise(res => chrome.storage.local.get(key, d => res(d[key] || null)));
+}
+
+async function saveCache(key, value) {
+  return new Promise(res => chrome.storage.local.set({ [key]: value }, res));
 }
 
 function markDone(img, val) {
@@ -155,8 +237,8 @@ function drawTranslated(img, regions) {
   else { const t = new Image(); t.crossOrigin = "anonymous"; t.onload = render; t.src = img.currentSrc || img.src; }
 
   const wrap = document.createElement("div");
-  wrap.style.cssText = "position:relative; display:inline-block; line-height:0;";
-  wrap.style.width   = computed.width;
+  wrap.style.cssText  = "position:relative; display:inline-block; line-height:0;";
+  wrap.style.width    = computed.width;
   wrap.style.maxWidth = "100%";
 
   img.parentNode.insertBefore(wrap, img);
@@ -246,21 +328,23 @@ function addToggle(wrap, canvas, img) {
 
 function watchForNewImages() {
   observerStarted = true;
+  const io = window._mangaLensIO;
   const observer = new MutationObserver(mutations => {
     for (const m of mutations) {
       for (const node of m.addedNodes) {
         if (node.nodeType !== 1) continue;
-        if (node.tagName === "IMG") queueImage(node);
-        node.querySelectorAll?.(`img:not([${DONE_ATTR}]):not([${PENDING_ATTR}])`).forEach(queueImage);
-      }
-      if (m.type === "attributes" && m.target.tagName === "IMG"
-          && (m.attributeName === "src" || m.attributeName === "data-src")) {
-        const t = m.target;
-        if (!t.hasAttribute(DONE_ATTR) && !t.hasAttribute(PENDING_ATTR)) queueImage(t);
+        const imgs = node.tagName === "IMG" ? [node] : [...(node.querySelectorAll?.("img") || [])];
+        for (const img of imgs) {
+          const w = img.naturalWidth  || img.clientWidth  || 0;
+          const h = img.naturalHeight || img.clientHeight || 0;
+          if (w >= MIN_SIZE && h >= MIN_SIZE && !img.hasAttribute(DONE_ATTR) && !img.hasAttribute(PENDING_ATTR)) {
+            io ? io.observe(img) : queueImage(img);
+          }
+        }
       }
     }
   });
-  observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "data-src"] });
+  observer.observe(document.body, { childList: true, subtree: true });
 }
 
 function loadSettings() {
